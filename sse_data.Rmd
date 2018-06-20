@@ -1,0 +1,2085 @@
+---
+title: "Social Simon Effect in Movement Trajectories - Data Analysis"
+output:
+      html_document:
+        keep_md: true
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+library(knitr)
+library(dplyr)
+library(mousetrap)
+library(data.table)
+library(ggplot2)
+library(afex)
+library(tidyr)
+library(cowplot)
+```
+
+This is a complete script for analyzing the data collected in the
+mouse-tracking Social Simon study and reported in the article (submitted). 
+The study consisted of 3 experiments:
+
+* experiment 1: individual Simon task, in which a person had to respond to two 
+colors by moving right or left and clicking on a response "button"
+* experiment 2: individual Go/NoGo version of the Simon task, in which a person 
+had to respond to only one of the two colors
+* experiment 3: joint Simon task, in which two people carried out the task
+together, responding each to one of the colors; this experiment included two conditions:
+    - Online condition: participants could see each other's mouse cursors
+    - Offline condition: participants could see only their own mouse cursor
+
+This script covers data preprocessing, data analysis reported in the article and
+some additional analysis.
+
+
+# Data pre-processing
+
+First we get summary statistics for the participants in all experiments.
+
+```{r get_participants, cache=TRUE}
+participants <- read.csv("./data/Participant_stats.csv")
+
+participants %>% group_by(experiment) %>%
+    dplyr::summarize(mean.age = mean(age), 
+              max.age = max(age),
+              min.age = min(age)) -> 
+    age.stats
+participants %>% group_by(experiment, sex) %>%
+    dplyr::summarize(gender.count = n()) -> gender.stats 
+kable(age.stats)
+kable(gender.stats)
+```
+
+Then we save the screen dimensions and relevant coordinates used in the experiment.
+
+```{r save_dimensions, cache=TRUE}
+# save experiment parameter values
+screen.width <- 1920
+screen.height <- 1080
+start.boundary <- 988 # upper boundary of the start button
+response.boundary <- 128 # lower boundary of response boxes
+stim.boundary <- 820 # the y-coord that needed to be crossed for stimulus to appear
+```
+
+```{r flipped_boundaries, echo=FALSE}
+# relevant boundaries with y flipped
+flipped.start.boundary <- screen.height - start.boundary
+flipped.response.boundary <- screen.height - response.boundary
+flipped.stim.boundary <- screen.height - stim.boundary
+```
+
+We then perform the following steps:
+
+**Step 1** Load the data and reformat it for easier processing.
+
+```{r 01_load_data_def, cache=TRUE, echo=FALSE}
+process.joint.mdata <- function(filename) {
+    # get all joint data for an experiment and restructure it into long format
+    mdata <- read.csv(filename)
+    names(mdata) <- gsub(x = names(mdata), pattern = "\\.", replacement = "0")
+    # coordinates for different people in separate columns
+    mdata.long <- reshape(mdata, varying=c(9:dim(mdata)[2]), direction="long", 
+                          timevar="order", idvar="trial", sep="_")
+    mdata.complete <- mdata.long[complete.cases(mdata.long),]
+    # just 2 columns for x and y coordinates
+    names(mdata.complete)[11:14] <- c("x_p1", "y_p1", "x_p2", "y_p2")
+    molten <- reshape(mdata.complete, varying=c(11:14), timevar="person", 
+                      direction="long", sep="_")
+    rownames(molten) <- c()
+    subid1 <- sort(unique(molten$subid))[1]
+    subid2 <- sort(unique(molten$subid))[2]
+    
+    molten <- mutate(molten, personid=ifelse((person == 'p1'),
+                                         subid1, subid2))
+    molten$pair <- as.factor(paste(as.character(unique(molten$subid)), 
+                                   collapse=""))
+    molten <- dplyr::select(molten, -id)
+    return(molten)
+}
+
+process.single.mdata <- function(filename) {
+    mdata <- read.csv(filename)
+    names(mdata) <- gsub(x = names(mdata), pattern = "\\.", replacement = "0")
+    first.times <- grep(names(mdata), pattern = "times_001")
+    mdata.long <- reshape(mdata, varying=c(first.times:dim(mdata)[2]), 
+                          direction="long", timevar="order", 
+                          idvar="trial", sep="_")
+    mdata.complete <- mdata.long[complete.cases(mdata.long),]
+    return(mdata.complete)
+}
+
+load.experiment <- function(exp.num) {
+    # get all experiment data for experiment
+    path <- paste(getwd(), '/data/Experiment', exp.num, sep="")
+    file.names <- list.files(path, full.names = TRUE)
+    
+    if (exp.num %in% c(3, 4)) {
+        exp <- do.call(rbind, lapply(file.names, process.joint.mdata))
+        # rename pair identifiers
+        pair.levels <- levels(exp$pair)
+        exp$pair <- plyr::mapvalues(exp$pair, from = pair.levels, 
+                                     to = c(1:length(pair.levels)))
+        exp$personid <- as.factor(exp$personid)
+    } else if (exp.num %in% c(1, 2)) {
+        exp <- do.call(rbind, lapply(file.names, process.single.mdata))
+        exp$personid <- as.factor(exp$subid)
+    }
+        exp$personid <- plyr::mapvalues(exp$personid, 
+                                     from = levels(exp$personid),
+                                     to = paste("c", as.character(exp.num), "p",
+                                                c(1:length(levels(exp$personid))), 
+                                                sep=""))
+        exp$condition <- as.character(exp.num)
+    return(exp)
+}
+```
+
+```{r 02_load_data, cache=TRUE, echo=FALSE}
+exp1 <- load.experiment(1)
+exp2 <- load.experiment(2)
+exp3 <- load.experiment(3)
+exp4 <- load.experiment(4)
+```
+
+The data was recorded in a wide format, in which each row represented a particular 
+trial. We transform it into a long format, in which each row corresponds to a 
+particular timestamp and x,y-coordinates of a single trial of a single person.
+
+The resulting first few rows of experiment 3, Offline condition:
+
+```{r exp_head, echo=FALSE}
+kable(head(exp3), digits=2)
+```
+
+**Step 2** Add the coding for independent variables on 
+
+* trial type, which depends on the congruency between the color of the cue and 
+its location
+* for experiment 2: whether it was the participant's turn to respond or inhibit a response,
+which depends on the color of the cue
+* for experiment 3: whose turn it was to respond in a given trial, 
+which depends on the color of the cue
+
+```{r 03_add_current_vars_def, cache=TRUE, echo=FALSE}
+add.current.vars <- function(exp) {
+    # add a variable that specifies trial type
+    exp <- mutate(exp, trial.type = ifelse(cuePos == cueColor, 'congruent', 'incongruent'))
+    if (exp$condition[1] %in% c(3, 4)) {
+        # add a variable that specifies the role
+        exp <- mutate(exp, role.type=ifelse(((cueColor == 1 & person == 'p1') |
+                                                (cueColor == 2 & person == 'p2')),
+                                                'active', 'passive' ))
+        exp <- arrange(exp, pair, personid, trial, order)
+    } else if (exp$condition[1] == 2) {
+        # add a variable that specifies the role
+        exp <- mutate(exp, role.type=ifelse(((block == 1 & cueColor == 1) |
+                                             (block == 2 & cueColor == 2) |
+                                             (block == 3 & cueColor == 1) |
+                                             (block == 4 & cueColor == 2)),
+                                            'active', 'passive' ))
+        exp <- arrange(exp, personid, trial, order)
+        
+    } else {
+        exp <- arrange(exp, personid, trial, order)
+    }
+    return(exp)    
+}
+```
+
+```{r 04_add_current_vars, cache=TRUE, echo=FALSE}
+exp1 <- add.current.vars(exp1)
+exp2 <- add.current.vars(exp2)
+exp3 <- add.current.vars(exp3)
+exp4 <- add.current.vars(exp4)
+```
+
+**Step 3** Flip y-coordinates vertically because the package that was
+used for collecting the data (Matlab Psychtoolbox) encodes the screen's top left 
+as coordinates [0, 0] and therefore y-coordinates grow towards the bottom of the screen
+while for ease of analysis we would like them to grow towards the screen's top.
+
+```{r 05_flip_y, cache=TRUE, echo=FALSE, fig.width=10}
+exp1$y <- screen.height - exp1$y
+exp2$y <- screen.height - exp2$y
+exp3$y <- screen.height - exp3$y
+exp4$y <- screen.height - exp4$y
+```
+
+**Step 4** Filter out only successful trials, in which participants did not miss any
+deadlines and a correct response was given.
+
+```{r 06_remove_failed_trials_def, cache=TRUE, echo=FALSE}
+remove.failed <- function(exp) {
+    if (exp$condition[1] == "1") {
+        exp %>% filter(cueColor == selectedBox) ->
+            exp
+    } else if (exp$condition[1] == "2") {
+        exp %>% filter(startTime > 0) %>% 
+            filter(stimTime > 0) %>%
+            filter((role.type == "active" & cueColor == selectedBox) |
+                    (role.type == "passive" & selectedBox == -1)) ->   
+            exp
+    } else {
+        exp %>% filter(startTime > 0) %>%        # clicked the start button
+            filter(stimTime > 0) %>%             # moved as requested
+            filter(cueColor == selectedBox) ->   # selected the correct response
+            exp
+    }
+    return(exp)
+}
+```
+
+```{r 07_remove_failed_trials, cache=TRUE, echo=FALSE}
+exp1.complete <- remove.failed(exp1)
+exp2.complete <- remove.failed(exp2)
+exp3.complete <- remove.failed(exp3)
+exp4.complete <- remove.failed(exp4)
+```
+
+**Step 5** Extract the relevant part of the trajectories, after the point in which
+participants have clicked on the start button.
+
+```{r 08_extract_trajectories_def, cache=TRUE, echo=FALSE}
+# extract trajectory portions after start click
+extract.trajectories <- function(person.data, start.border) {
+    if (person.data$condition[1] == "1") {
+        own.start.index <- max(which(person.data$y <= start.border))+1
+        num.times <- dim(person.data)[1]
+        mdata <- person.data[own.start.index:num.times,]
+    } else{
+        start.time <- person.data$startTime[1]
+        after.startTime <- person.data$times > start.time
+        start.index <- min(which(after.startTime==TRUE))
+        num.times <- dim(person.data)[1]
+        if (person.data$y[start.index] < start.border | 
+            person.data$condition[1] == "2") {
+            # this works only for the person who clicked second
+            mdata <- person.data[person.data$times > start.time,]
+        } else {
+            # for the other person we have to infer...
+            before.start <- person.data[1:start.index,]
+            own.start.index <- max(which((before.start$y > start.border)==FALSE))+1
+            mdata <- person.data[own.start.index:num.times,]
+        }
+    }
+    return(mdata)
+}
+
+get.subset <- function(exp) {
+    exp %>% group_by(personid, trial) %>% 
+        do(extract.trajectories(., flipped.start.boundary)) %>%
+        ungroup() ->
+        exp.subset
+
+    # reset sampling order to start from 0
+    exp.subset %>% group_by(personid, trial) %>% 
+        do(mutate(., sampling.order=c(1:(max(order) - min(order) + 1)))) %>%
+        ungroup() %>% as.data.frame() -> 
+        exp.subset
+    return(exp.subset)
+}
+```
+
+```{r 09_extract_trajectories, cache=TRUE, echo=FALSE}
+exp1.subset <- get.subset(exp1.complete)
+exp2.subset <- get.subset(exp2.complete)
+exp3.subset <- get.subset(exp3.complete)
+exp4.subset <- get.subset(exp4.complete)
+```
+
+**Step 6** Rescale space
+
+For convenience we rescale the coordinates into a standard mouse-tracking
+coordinate space, where x is in range [-1, 1] and y in range [0, 1.5].
+
+```{r 10_space_rescaling_def, cache=TRUE, echo=FALSE}
+rescale.space <- function(coordinates, new_min, new_max, old_min, old_max){
+    # Rescales space to given x- and y-limits and centers on the origin.
+    # :param coordinates: (array) array of coordinates to rescale
+    # :param new_min: (int) new minimum limit
+    # :param new_max: (int) new maximum limit
+    # :param old_range: (int) original range of the data (screen width or height)
+    # :return: space-normalized array
+    new_range <- new_max - new_min
+    old_range <- old_max - old_min
+    rescaled <- ((((coordinates - old_min) * new_range) / old_range) + new_min)
+    return(rescaled)
+}
+
+scaled.start.boundary <- rescale.space(flipped.start.boundary, 
+                                       0, 1.5, 0, 
+                                       screen.height)
+scaled.response.boundary <- rescale.space(flipped.response.boundary, 
+                                          0, 1.5, 0, 
+                                          screen.height)
+scaled.stim.boundary <- rescale.space(flipped.stim.boundary, 
+                                      0, 1.5, 0, 
+                                      screen.height)
+
+get.scaled <- function(exp) {
+    exp$x.scaled <- rescale.space(exp$x, -1, 1, 0, screen.width)
+    exp$y.scaled <- rescale.space(exp$y, 0, 1.5, 0, screen.height)
+    return(exp)
+}
+```
+
+```{r 11_space_rescaling, cache=TRUE, echo=FALSE}
+exp1.scaled <- get.scaled(exp1.subset)
+exp2.scaled <- get.scaled(exp2.subset)
+exp3.scaled <- get.scaled(exp3.subset)
+exp4.scaled <- get.scaled(exp4.subset)
+```
+
+**Step 7** Align to common origin of [0, 0] and reset timestamps to start at 0.
+
+```{r 12_align_trajectories_def, cache=TRUE, echo=FALSE}
+normalize.space <- function(coordinates) {
+    new.coord <- coordinates - coordinates[1]
+    return(new.coord)
+}
+
+get.stim.time <- function(stim.time, times) {
+    return(stim.time - times[1])    
+}
+
+get.aligned <- function(exp) {
+    if (exp$condition[1] == "1") {
+        exp %>% group_by(personid, trial) %>% 
+        do(mutate(., x.aligned = normalize.space(x.scaled), 
+                  y.aligned = normalize.space(y.scaled),
+                  t.aligned = normalize.space(times))) %>%
+            ungroup() %>% as.data.frame() -> exp
+    } else {
+    exp %>% group_by(personid, trial) %>% 
+    do(mutate(., x.aligned = normalize.space(x.scaled), 
+              y.aligned = normalize.space(y.scaled),
+              t.aligned = normalize.space(times),
+              stim.aligned = get.stim.time(stimTime, times))) %>%
+        ungroup() %>% as.data.frame() -> exp
+    }
+    # given that we have no data regarding previous trial for trial 1, remove them
+    exp <- exp[complete.cases(exp),]
+    return(exp)    
+}
+```
+
+```{r 13_align_trajectories, cache=TRUE, echo=FALSE}
+exp1.aligned <- get.aligned(exp1.scaled)
+exp2.aligned <- get.aligned(exp2.scaled)
+exp3.aligned <- get.aligned(exp3.scaled)
+exp4.aligned <- get.aligned(exp4.scaled)
+```
+
+At this point we can already visualize all trajectories of all individual participants
+and pairs.
+
+```{r 14_all_trajectories, cache=TRUE, message=FALSE, warning=FALSE, echo=FALSE}
+# Visualize all individual participants
+theme_set(theme_grey())
+ggplot(data = exp1.aligned, aes(x=x.aligned, y=y.aligned, group=trial)) +
+    geom_path() + xlim(-1, 1) + ylim(0, 1.5) + facet_wrap(~personid) +
+    ggtitle("Trajectories for all participants for all trials, experiment 1") +
+    theme(plot.title = element_text(hjust = 0.5))
+
+ggplot(data = exp2.aligned, aes(x=x.aligned, y=y.aligned, 
+                                color=role.type, group=trial)) +
+    geom_path() + xlim(-1, 1) + ylim(0, 1.5) + facet_wrap(~personid) +
+    ggtitle("Trajectories for all participants for all trials, experiment 2") +
+    theme(plot.title = element_text(hjust = 0.5))
+
+# Visualize all pairs
+ggplot(data = exp3.aligned, aes(x=x.aligned, y=y.aligned, 
+                                color=person, group=trial)) +
+    geom_path() + xlim(-1, 1) + ylim(0, 1.5) + facet_wrap(~pair) +
+    ggtitle("Trajectories for all pairs for all trials, experiment 3, Online condition") +
+    theme(plot.title = element_text(hjust = 0.5))
+ggplot(data = exp4.aligned, aes(x=x.aligned, y=y.aligned, 
+                                color=person, group=trial)) +
+    geom_path() + xlim(-1, 1) + ylim(0, 1.5) + facet_wrap(~pair) +
+    ggtitle("Trajectories for all pairs for all trials, experiment 3, Offline condition") +
+    theme(plot.title = element_text(hjust = 0.5))
+```
+
+We see that in experiment 1, participant 5 has only few trajectories. We
+can confirm this by looking at the number of trials this person has:
+
+```{r 15_exp1p5}
+p5 <- filter(exp1.aligned, personid == "c1p5")
+length(unique(p5$trial))
+
+# removing the participant data
+exp1.aligned <- filter(exp1.aligned, personid != "c1p5")
+```
+
+In experiment 3, we see that most pairs seem to divide the screen space between 
+each other by moving mostly directly towards their assigned response box and 
+avoiding the center. However, there are exceptions. 
+
+In condition with visual feedback one particular pair (11) has mostly 
+upward moving trajectories. We can further explore here whether the joint upward 
+motion is induced by one of the participants or happens immediately on both sides.
+
+```{r 16_aberrant_pair, cache=TRUE, echo=FALSE}
+theme_set(theme_grey())
+# plot the first 5 trials of aligned trajectories
+p7.early <- filter(exp3.aligned, pair==11, trial %in% c(1:7))
+ggplot(data = p7.early, 
+       aes(x=x.aligned, y=y.aligned, group=trial, color=role.type)) +
+    geom_path() + xlim(-1, 1) + ylim(0, 1.5) + 
+    facet_grid(trial~person)
+```
+
+The plot presents trajectories in the first couple of trials (1-7) of two
+participants from pair 11. The trajectories are colored red for when participant's
+role was "active", i.e. the cue that appeared had their assigned color and blue for
+when their role was "passive", i.e. their task in such a trial was to not press
+the response button and simply go back to the start position.
+
+From the plots it would appear that one of the members of this aberrant couple
+(person 2) adopts a "move upward" strategy from the start, independently of whether
+it is their turn to respond or not. The other person in that couple seems to copy
+the co-actor's movements on passive trials and make large discrete errors on the trials
+in which it is actually their turn to respond. Why this particular couple behaves
+in this manner is unfortunately unknown and might indicate some individual differences,
+the feeling of jointness experienced by this couple or conscious strategies that 
+people adopt in such a task.
+
+In condition without visual feedback it is rather that certain individuals 
+adopt the "move upward" strategy, independently of their partner (which is to be
+expected since they do not see the partner's movements).
+
+**Step 8** Flip trajectories
+
+As the next pre-processing step we will flip all trajectories to one side.
+This ensures that every trajectory starts at the bottom of the coordinate system 
+and ends in the top right corner. It is done to obtain comparable trajectory 
+measures.
+
+```{r 17_flip_x_def, cache=TRUE, echo=FALSE}
+flip.x <- function(coordinates) {
+    n.coord <- length(coordinates)
+    n.neg <- sum(coordinates<0)
+    
+    if (coordinates[n.coord] < -0.1 || n.neg > (0.5*n.coord)) {
+        coordinates <- coordinates * -1
+    }
+    return(coordinates)
+}
+
+flip.x.con2 <- function(coordinates, block) {
+    if (block %in% c(1, 3)) {
+        coordinates <- coordinates * -1   
+    }
+    return(coordinates)
+}
+
+get.clean <- function(exp) {
+    if (exp$condition[1] == "2") {
+        exp %>% group_by(personid, trial) %>% 
+            do(mutate(., x.flipped = flip.x.con2(x.aligned, block[1]))) %>%
+            ungroup() %>% as.data.frame() -> 
+            exp
+    } else {
+        exp %>% group_by(personid, trial) %>% 
+            do(mutate(., x.flipped = flip.x(x.aligned))) %>%
+            ungroup() %>% as.data.frame() -> 
+            exp
+    }
+    
+    # also convert times into ms
+    exp$t.aligned <- exp$t.aligned*1000
+    if (exp$condition[1] == "1") {
+        exp %>% 
+            dplyr::select(-c(order, times, x, y, 
+                      x.scaled, y.scaled, x.aligned)) -> 
+            exp
+    } else {
+        # remove irrelevant columns
+        exp %>% 
+            dplyr::select(-c(startTime, stimTime, order, times, x, y, 
+                      x.scaled, y.scaled, x.aligned)) -> 
+            exp
+    }
+    return(exp)
+}
+```
+
+```{r 18_flip_x, cache=TRUE, echo=FALSE}
+exp1.clean <- get.clean(exp1.aligned)
+exp2.clean <- get.clean(exp2.aligned)
+exp3.clean <- get.clean(exp3.aligned)
+exp4.clean <- get.clean(exp4.aligned)
+```
+
+**Step 9** Remove outliers
+
+As a last step, we look at a sampling rate distribution to see whether it reveals 
+any outliers that could indicate missing data or wrong recording.
+
+```{r 19_interval_sanity, cache=TRUE, echo=FALSE}
+interval.outliers <- function(exp) {
+    exp %>% group_by(personid, trial) %>% 
+        do(as.data.frame(diff(.$t.aligned, lag=1))) -> 
+        tdiff
+    colnames(tdiff)[3] <- 'intervals'
+    # identify which person and trial the data comes from
+    ptmissing <- unique(tdiff[which(tdiff$intervals > 3*sd(tdiff$intervals) +
+                                        mean(tdiff$intervals)), 1:2])
+    filter.key <- paste(ptmissing$personid, ptmissing$trial, sep=".")
+    exp$ptkey <- paste(exp$personid, exp$trial, sep = ".")
+    exp <- subset(exp, !(ptkey %in% filter.key))
+    exp <- ungroup(exp)
+    return(list(exp, tdiff))
+}
+
+res1 <- interval.outliers(exp1.clean)
+exp1.clean <- res1[[1]]
+tdiff1 <- res1[[2]]$intervals
+
+res2 <- interval.outliers(exp2.clean)
+exp2.clean <- res2[[1]]
+tdiff2 <- res2[[2]]$intervals
+
+res3 <- interval.outliers(exp3.clean)
+exp3.clean <- res3[[1]]
+tdiff3 <- res3[[2]]$intervals
+
+res4 <- interval.outliers(exp4.clean)
+exp4.clean <- res4[[1]]
+tdiff4 <- res4[[2]]$intervals
+```
+
+From the data we can extract all intervals between adjacent sampling points and
+calculate their mean and standard devation. We then establish a cutoff point of
+3 SD from the mean beyond which the sampling interval is considered to be an outlier.
+We calculate the number of such outliers for each condition and their mean sampling
+rate. The resulting numbers are presented in the following table.
+
+```{r 20_interval_stats, cache=TRUE, echo=FALSE}
+n <- max(length(tdiff1), length(tdiff2), length(tdiff3), length(tdiff4))
+length(tdiff1) <- n
+length(tdiff2) <- n
+length(tdiff3) <- n
+length(tdiff4) <- n
+
+all.intervals <- data.frame(cbind(tdiff1, tdiff2, tdiff3, tdiff4))
+rate.means <- colMeans(all.intervals, na.rm=TRUE)
+rate.sds <- apply(all.intervals, 2, sd, na.rm=TRUE)
+rate.cutoff <- rate.means + rate.sds * 3
+
+num.outliers <- apply(all.intervals, 2, 
+                function(x) sum(x > (3 * sd(x, na.rm=TRUE) + mean(x, na.rm=TRUE)), 
+                                na.rm=TRUE))
+mean.outliers <- apply(all.intervals, 2, 
+                function(x) mean(x[which(x > (3 * sd(x, na.rm=TRUE) + 
+                                                  mean(x, na.rm=TRUE)))]))
+outlier.info <- cbind(rate.means, rate.sds, rate.cutoff, num.outliers, mean.outliers)
+rownames(outlier.info) <- c("exp1", "exp2", "exp3:online", "exp4:offline")
+
+kable(outlier.info, digits=2)
+```
+
+It turns out that the mean sampling rate for all experiments is 
+within expected parameters given the set sampling rate of 92 Hz. The number of
+outliers and their means varies with much larger deviations in experiment 3. 
+Given the cross-computer data stream in the social task, some amount
+of data loss is to be expected. We remove trials that contain these large deviations.
+
+Next we look at y coordinates that should not be lower than some margin around 0
+(after flipping and alignment). A y-coordinate that is more negative indicates a
+faulty recording of the start button press.
+
+```{r 21_y_sanity_def, cache=TRUE, echo=FALSE}
+# y coordinates below -0.5 are a result of wrong recording of the start press
+# sum(exp3.aligned.clean$y.aligned < -0.1)
+y.outliers2 <- function(exp) {
+    exp %>%
+        filter(y.aligned < -0.1) %>%
+        dplyr::select(personid, trial) %>% unique() ->
+        yglitch
+    yglitch <- as.data.frame(yglitch)
+    filter.key <- paste(yglitch$personid, yglitch$trial, sep=".")
+    exp <- subset(exp, !(ptkey %in% filter.key))
+    return(exp)
+}
+
+y.outliers <- function(exp) {
+    exp %>%
+        filter(y.aligned < -0.1) %>%
+        dplyr::select(pair, trial) %>% unique() ->
+        yglitch
+    yglitch <- as.data.frame(yglitch)
+    yglitch$pair <- as.integer(as.character(yglitch$pair))
+    filter.key <- paste(yglitch$pair, yglitch$trial, sep=".")
+    exp$ctkey <- paste(exp$pair, exp$trial, sep = ".")
+    exp <- subset(exp, !(ctkey %in% filter.key))
+    return(exp)
+}
+```
+
+```{r 22_y_sanity, cache=TRUE, echo=FALSE}
+exp1.clean <- y.outliers2(exp1.clean)
+exp2.clean <- y.outliers2(exp2.clean)
+exp3.clean <- y.outliers(exp3.clean)
+exp4.clean <- y.outliers(exp4.clean)
+#TODO: count these
+```
+
+With the sampling timing issues fixed, we can examine reaction time outliers.
+
+```{r 23_trial_speed_def, cache=TRUE, echo=FALSE}
+get.RT <- function(time_coordinates) {
+    n.coord <- length(time_coordinates)
+    return(time_coordinates[n.coord])
+}
+
+time.outliers <- function(exp) {
+    exp %>% group_by(personid, trial) %>% 
+        do(mutate(., total.time = get.RT(t.aligned))) %>%
+        ungroup() ->
+        exp
+    exp %>% group_by(personid) %>%
+        mutate(., median.time = median(total.time)) %>%
+        ungroup() ->
+        exp
+    # remove particularly slow trials
+    outlierRT <- mean(exp$total.time) + 
+        3*sd(exp$total.time)
+    exp %>% group_by(personid, trial) %>% 
+        filter(total.time < outlierRT) -> 
+        exp
+    return(exp)
+}
+```
+
+```{r 24_trial_speed, cache=TRUE, echo=FALSE}
+exp1.clean <- time.outliers(exp1.clean)
+exp2.clean <- time.outliers(exp2.clean)
+exp3.clean <- time.outliers(exp3.clean)
+exp4.clean <- time.outliers(exp4.clean)
+#TODO: report on this
+```
+
+```{r 25_combine_conditions, cache=TRUE, warning=FALSE, echo=FALSE}
+# combine the two social data frames into a single data frame
+exp.clean <- rbind(exp3.clean, exp4.clean)
+```
+
+
+**Step 10** Transform into a mousetrap object
+
+For the analysis we will use a mousetrap package so we transform the data frames
+into mousetrap objects.
+
+```{r 26_create_mousetrap, cache=TRUE, echo=FALSE}
+mtdata1 <- mt_import_long(exp1.clean, 
+                        xpos_label = 'x.flipped', 
+                        ypos_label = 'y.aligned', 
+                        timestamps_label = 't.aligned', 
+                        mt_id_label = c('personid','trial'), 
+                        mt_seq_label = 'sampling.order', 
+                        reset_timestamps = FALSE)
+mtdata2 <- mt_import_long(exp2.clean, 
+                        xpos_label = 'x.flipped', 
+                        ypos_label = 'y.aligned', 
+                        timestamps_label = 't.aligned', 
+                        mt_id_label = c('personid','trial'), 
+                        mt_seq_label = 'sampling.order', 
+                        reset_timestamps = FALSE)
+
+
+mtdata <- mt_import_long(exp.clean, 
+                        xpos_label = 'x.flipped', 
+                        ypos_label = 'y.aligned', 
+                        timestamps_label = 't.aligned', 
+                        mt_id_label = c('personid','trial'), 
+                        mt_seq_label = 'sampling.order', 
+                        reset_timestamps = FALSE)
+```
+
+**Step 11** Normalize trajectories
+
+As a final pre-processing step, we perform time normalization on the data, in 
+which the times and coordinates are linearly interpolated so that each trajectory 
+contains the same number of recorded points (typically set to 101 points).
+
+```{r 27_time_normalize, cache=TRUE, echo=FALSE}
+mtdata1 <- mt_time_normalize(mtdata1)
+mtdata2 <- mt_time_normalize(mtdata2)
+mtdata <- mt_time_normalize(mtdata)
+```
+
+**Step 12** Check observation counts
+
+We check whether all participants have a balanced number of observations 
+for different variables of interest by plotting observation counts per person
+per condition.
+
+```{r 28_check_observations_def, cache=TRUE, warning=FALSE, echo=FALSE}
+get.counts <- function(exp) {
+    exp.dt <- data.table(exp)
+    if (exp$condition[1] == "1") {
+        # counts <- exp.dt[, .(rowCount = .N), by = list(personid, trial.type)]
+        counts <- exp.dt[, .(trialCount = uniqueN(trial)), 
+                         by = list(personid, trial.type)]
+        counts <- arrange(counts, personid, trial.type)
+    } else {
+        # counts <- exp.dt[, .(rowCount = .N), by = list(personid, 
+        #                                            trial.type, role.type)]
+        counts <- exp.dt[, .(trialCount = uniqueN(trial)), 
+                         by = list(personid, trial.type, role.type)]
+        counts <- arrange(counts, personid, trial.type, role.type)
+    }
+    return(counts)
+}
+```
+
+```{r 29_check_observations, cache=TRUE, echo=FALSE}
+counts1 <- get.counts(exp1.complete)
+counts2 <- get.counts(exp2.complete)
+counts3 <- get.counts(exp3.complete)
+counts4 <- get.counts(exp4.complete)
+```
+
+```{r 30_plot_counts, cache=TRUE, echo=FALSE, warning=FALSE, fig.width=10}
+theme_set(theme_grey())
+ggplot(counts1, aes(x=as.factor(personid), y=trialCount, fill=trial.type)) + 
+    geom_histogram(stat="identity", position="dodge", width=.8) +
+    scale_fill_brewer(palette="Set1") + 
+    ylim(0, 400) + theme(legend.direction="horizontal", legend.position = c(.7, .9)) +
+    ggtitle("Trial counts in experiment 1")
+
+ggplot(counts2, aes(x=as.factor(personid), y=trialCount, fill=trial.type)) + 
+    geom_bar(stat="identity", position="dodge", width=.8) +
+    scale_fill_brewer(palette="Set1") + 
+    facet_grid(role.type ~ .) +
+    ylim(0, 225) + theme(legend.direction="horizontal", legend.position = c(.7, .9)) +
+    ggtitle("Trial counts in experiment 2")
+
+ggplot(counts3, aes(x=as.factor(personid), y=trialCount, 
+                    fill=trial.type)) + 
+    geom_bar(stat="identity", position="dodge", width=.8) + 
+    #scale_color_manual(values = c("darkgrey", "black")) +
+    scale_fill_brewer(palette="Set1") + 
+    facet_grid(role.type ~ .) +
+    ylim(0, 225) + theme(legend.direction="horizontal", legend.position = c(.7, .9)) +
+    ggtitle("Trial counts in experiment 3, Online condition")
+
+ggplot(counts4, aes(x=as.factor(personid), y=trialCount, 
+                    fill=trial.type)) + 
+    geom_bar(stat="identity", position="dodge", width=.8) + 
+    # scale_color_manual(values = c("darkgrey", "black")) +
+    scale_fill_brewer(palette="Set1") + 
+    facet_grid(role.type ~ .) +
+    ylim(0, 225) + theme(legend.direction="horizontal", legend.position = c(.7, .9)) +
+    ggtitle("Trial counts in experiment 3, Offline condition")
+```
+
+From the counts plot, we can see that in experiments 1 and 2 one person in each
+has markedly less successful trials than other participants. In experiment 3,
+Online condition, even though different numbers of trials remain for different 
+pairs after removing unsuccessful ones, there are similar counts for different 
+trial and role types.
+
+By contrast, in experiment 3, Offline condition, three of the pairs completely 
+lose observations for one of the incongruent set of trials, namely participants 
+with ids 14, 23, 29 lose incongruent active trials while their co-actors 
+(ids 13, 24, 30) incongruent passive ones. Further investigation of these counts 
+reveals that the crucial step that leads to this loss is filtering out trials in 
+which incorrect response was given, that is, participant clicked on the wrong 
+response box. Given that this correlates with trials being incongruent (the cue 
+appeared on the same side as the incorrect response box), we might infer that 
+participants 14, 23 and 29 misunderstood the task, i.e. they were responding to 
+the location of the cue, rather than its color. We can confirm this conclusion by 
+plotting the trajectories of these participants.
+
+```{r 31_plot_wrong_people, cache=TRUE, echo=FALSE, message=FALSE}
+wrong.parts <- filter(exp4, personid=="c4p14" | personid=="c4p23" | personid=="c4p29")
+wrong.parts %>% filter(startTime > 0) %>% filter(stimTime > 0) ->
+    wrong.parts
+
+wrong.parts %>% group_by(personid, trial) %>% 
+    do(extract.trajectories(., flipped.start.boundary)) -> 
+    wrong.subset
+
+wrongdata <- mt_import_long(wrong.subset, 
+                        xpos_label = 'x', ypos_label = 'y', 
+                        timestamps_label = 'times', 
+                        mt_id_label = c('personid','trial'), 
+                        mt_seq_label = 'order', 
+                        reset_timestamps = FALSE)
+wrongdata <- mt_align_start(wrongdata)
+wrongdata <- mt_time_normalize(wrongdata)
+
+avg.wrongdata <- mt_aggregate_per_subject(wrongdata,
+                    use="tn_trajectories", 
+                    use2_variables=c("trial.type", "role.type"),
+                    subject_id="personid")
+
+theme_set(theme_grey())
+ggplot(avg.wrongdata, aes(x=xpos, y=ypos, 
+                     linetype=trial.type, color=role.type)) + 
+    geom_path() + facet_wrap(~as.factor(personid)) +
+    ggtitle("Average time-normalized trajectories of the failed participants")
+```
+
+We see that indeed, 3 participants in condition 4 misunderstood the instructions
+and therefore need to be removed from further analysis.
+
+```{r 32_remove_wrong, cache=TRUE, echo=FALSE}
+mtdata1 <- mt_subset(mtdata1, personid != "c1p5")
+mtdata2 <- mt_subset(mtdata2, personid != "c2p11")
+
+# why do i remove these?
+# c2p16 makes circular motions in passive trials, which creates
+# difficulties for later plotting, analysis and clustering
+#mtdata2 <- mt_subset(mtdata2, !(personid == "c2p16" & role.type == "passive"))
+# c2p17 returns to the starting point which creates problems for the package
+#mtdata2 <- mt_subset(mtdata2, !(personid == "c2p17" & role.type == "passive"))
+# ? these should not be a ground for eliminating data but only for
+# adjusting measures on passive data...
+
+mtdata <- mt_subset(mtdata, !(personid %in% c("c3p5", "c3p6", "c4p3", "c4p4",
+                                              "c4p14", "c4p23", "c4p29")))
+mtdata <- mt_subset(mtdata, !(condition == 4 & role.type == 'passive' & 
+                            (personid %in% c("c4p13", "c4p24", "c4p30"))))
+```
+
+```{r 33_percentage_removed, cache=TRUE, echo=FALSE}
+# get.percentage <- function(exp, cond_num, mtdata) {
+#     before <- 640 * length(unique(exp$personid))
+#     mtdata$data %>% filter(condition==cond_num) %>% dim() -> after
+#     per.removed <- 1 - after[1]/before
+#     return(per.removed)    
+# }
+
+get.percentage <- function(counts, orig.N) {
+    # num trials before
+    before <- 640 * orig.N
+    after <- sum(counts$trialCount)
+    per.removed <- 1 - after/before
+    return(per.removed)    
+}
+
+counts1 <- filter(counts1, personid != "c1p5")
+counts2 <- filter(counts2, personid != "c2p11")
+counts3 <- filter(counts3, !(personid %in% c("c3p5", "c3p6")))
+counts4 <- filter(counts4, !(personid %in% c("c4p3", "c4p4", "c4p14", 
+                                             "c4p23", "c4p29")))
+counts4 <- filter(counts4, !((role.type == 'passive') & 
+                            (personid %in% c("c4p13", "c4p24", "c4p30"))))
+
+
+per1 <- get.percentage(counts1, 20)
+per2 <- get.percentage(counts2, 20)
+per3 <- get.percentage(counts3, 30)
+per4 <- get.percentage(counts4, 30)
+```
+
+As a result of data cleaning, `r round(per1*100,1)`%, `r round(per2*100)`%, 
+`r round(per3*100) + round(per4*100)`% of trials in experiments 1-3 are removed.
+
+# Dependent variables calculation
+
+There is a number of measures that can be calculated on the basis of raw time
+and normalized trajectories. Here we are interested only in the latter, although
+a more complex analysis could involve looking at measures like velocity that require raw times.
+
+```{r 34_mt_measures, cache=TRUE, echo=FALSE, message=FALSE, warning=FALSE}
+# get mt measures for all experiments
+mtdata1 <- mt_measures(mtdata1, use="trajectories", save_as = "measures")
+mtdata2 <- mt_measures(mtdata2, use="trajectories", save_as = "measures")
+mtdata <- mt_measures(mtdata, use="trajectories", save_as = "measures")
+```
+
+These are the measures that are returned by mousetrap:
+
+| Measure | Definition |
+|:--------|:-----------------------------------------------|
+|xpos_max|   Maximum x-position|
+|xpos_min|   Minimum x-position|
+|ypos_max|   Maximum y-position|
+|ypos_min|   Minimum y-position|
+|MAD|        Signed Maximum absolute deviation from the direct path connecting start and end point of the trajectory (straight line). If the MAD occurs above the direct path, this is denoted by a positive value; if it occurs below, by a negative value.|
+| MAD_time|   Time at which the maximum absolute deviation was reached first|
+| MD_above|   Maximum deviation above the direct path|
+| MD_above_time|  Time at which the maximum deviation above was reached first|
+| MD_below|   Maximum deviation below the direct path|
+| MD_below_time|  Time at which the maximum deviation below was reached first|
+| AD|         Average deviation from direct path|
+| AUC|        Area under curve, the geometric area between the actual trajectory and the direct path where areas below the direct path have been subtracted|
+| xpos_flips|         Number of directional changes along x-axis (exceeding the distance specified in flip_threshold)|
+| ypos_flips|         Number of directional changes along y-axis (exceeding the distance specified in flip_threshold)|
+| xpos_reversals|     Number of crossings of the y-axis|
+| ypos_reversals|     Number of crossings of the x-axis|
+| RT|                 Response time, time at which tracking stopped|
+| initiation_time|    Time at which first mouse movement was initiated|
+| idle_time|    Total time without mouse movement across the entirety of the trial|
+
+Out of these measures, the most widely used are measures of the curvature of mouse
+trajectories, i.e. MAD, AD and AUC. A variety of time-based measures allows us
+to examine movement duration in different stages of the trajectory. Finally,
+coordinate flips and reversals are a proxy for movement complexity (which we
+later examine with an alternative entropy-based measure).
+
+For the purpose of this paper we focus on the shape of movement trajectories
+and basic reaction time measure.
+
+Our data for experiments 2 and 3 contains trials in which a participant's role was 
+'active', i.e., it was their turn to respond to the cue, and trials in which the 
+role was 'passive', i.e., their task was to refrain from responding. 
+It is reasonable to assume that different cognitive processes are at play in 
+these types of trials and that different trajectories should result. 
+Therefore, for further analysis we split the data into two groups: 
+active and passive data and we examine them separately.
+
+```{r 35_active_passive, cache=TRUE, echo=FALSE}
+active2 <- mt_subset(mtdata2, role.type=="active")
+passive2 <- mt_subset(mtdata2, role.type=="passive")
+activedata <- mt_subset(mtdata, role.type=='active')
+passivedata <- mt_subset(mtdata, role.type=='passive')
+```
+
+```{r 36_maxys, cache=TRUE, echo=FALSE, message=FALSE}
+get.maxy.time <- function(mtdata) {
+    for (i in 1:nrow(mtdata$trajectories)) {
+        # indexes of max y coordinate
+        max_positions <- which(mtdata$trajectories[i,,"ypos"] == 
+                            max(mtdata$trajectories[i,,"ypos"], na.rm=TRUE)) 
+        # the last index
+        last_max_pos <- max_positions[length(max_positions)]
+        mtdata$measures[i,"ypos_max_time"] <- 
+            mtdata$trajectories[i,last_max_pos,"timestamps"]
+    }
+    return(mtdata)
+}
+
+mtdata2 <- get.maxy.time(mtdata2)
+```
+
+Finally, we aggregate dependent measures by averaging across trials within each 
+participant for every level of the independent variable (Trial Type).
+
+```{r 37_measures, cache=TRUE, message=FALSE, echo=FALSE, warning=FALSE, message=FALSE}
+aggregated.measures1 <- mt_aggregate_per_subject(mtdata1, 
+                        use = 'measures', subject_id = "personid", 
+                        use2_variables = "trial.type")
+aggregated.measures1$condition <- "1"
+aggregated.measures1.active <- dplyr::select(aggregated.measures1, 
+                                             personid, trial.type, condition, AUC, RT)
+
+aggregated.measures2 <- mt_aggregate_per_subject(mtdata2, 
+                        use = 'measures', subject_id = "personid", 
+                        use2_variables = c("trial.type", "role.type"))
+aggregated.measures2$condition <- "2"
+aggregated.measures2 %>% filter(role.type == "active") %>%
+    dplyr::select(., personid, trial.type, condition, AUC, RT) ->
+    aggregated.measures2.active 
+aggregated.measures2 %>% filter(role.type == "passive") %>%
+    dplyr::select(., personid, trial.type, condition, AUC, RT, 
+                  ypos_max_time) ->
+    aggregated.measures2.passive
+
+aggregated.measures34 <- mt_aggregate_per_subject(mtdata, 
+                        use = 'measures', subject_id = "personid", 
+                        use2_variables = c("condition", "trial.type", "role.type"))
+aggregated.measures34 %>% filter(role.type == "active") %>%
+    dplyr::select(., personid, trial.type, condition, AUC, RT) ->
+    aggregated.measures34.active 
+aggregated.measures34 %>% filter(role.type == "passive") %>%
+    dplyr::select(., personid, trial.type, condition, AUC, RT) ->
+    aggregated.measures34.passive
+
+all.measures.active <- bind_rows(aggregated.measures1.active, 
+                             aggregated.measures2.active,
+                             aggregated.measures34.active)
+all.measures.active$condition <- as.factor(all.measures.active$condition)
+
+all.measures.passive <- bind_rows(aggregated.measures2.passive,
+                                  aggregated.measures34.passive)
+```
+
+
+# Exploratory Analysis
+
+```{r 38_descr_stats_rt, echo=FALSE, eval=FALSE}
+desc.stats.RT <- by(all.measures.active$RT, 
+   list(all.measures.active$trial.type,
+        all.measures.active$condition), 
+   stat.desc, basic=FALSE, norm=TRUE)
+
+desc.stats.AUC <- by(all.measures.active$AUC, 
+   list(all.measures.active$trial.type,
+        all.measures.active$condition), 
+   stat.desc, basic=FALSE, norm=TRUE)
+
+# check for normality:
+norm.test.RT <- by(all.measures.active$RT,
+        list(all.measures.active$trial.type,
+        all.measures.active$condition), 
+   shapiro.test)
+
+norm.test.AUC <- by(all.measures.active$AUC,
+        list(all.measures.active$trial.type,
+        all.measures.active$condition), 
+   shapiro.test)
+
+# The RT distribution in condition 4 was significantly non-normal, 
+# W=0.89, p=.013 for congruent and W=0.91, p=.025 for incongruent trials.
+
+# positive skeweness - piling on the left
+# positive kurtosis - pointy
+# are skew.2SE and kurt.2SE greater than 1? or smaller than -1?
+# is norm.p significant? then it's not normal
+
+# homogeneity of variance:
+leveneTest(RT ~ trial.type*condition, data=aggregated.measures34.active)
+leveneTest(AUC ~ trial.type*condition, data=aggregated.measures34.active)
+# The variances were similar for different groups, 
+# RT: F(3, 102)=0.13, ns.
+# AUC: F(3, 102) = 0.03, ns.
+```
+
+## Reaction time plots
+
+```{r 39_se_functions, cache=TRUE, echo=FALSE, warning=FALSE, message=FALSE}
+## Gives count, mean, standard deviation, standard error of the mean, and 
+## confidence interval (default 95%).
+##   data: a data frame.
+##   measurevar: the name of a column that contains the variable to be summariezed
+##   groupvars: a vector containing names of columns that contain grouping variables
+##   na.rm: a boolean that indicates whether to ignore NA's
+##   conf.interval: the percent range of the confidence interval (default is 95%)
+summarySE <- function(data=NULL, measurevar, groupvars=NULL, na.rm=FALSE,
+                      conf.interval=.95, .drop=TRUE) {
+    # New version of length which can handle NA's: if na.rm==T, don't count them
+    length2 <- function (x, na.rm=FALSE) {
+        if (na.rm) sum(!is.na(x))
+        else       length(x)
+    }
+
+    # This does the summary. For each group's data frame, return a vector with
+    # N, mean, and sd
+    datac <- plyr::ddply(data, groupvars, .drop=.drop,
+      .fun = function(xx, col) {
+        c(N    = length2(xx[[col]], na.rm=na.rm),
+          mean = mean   (xx[[col]], na.rm=na.rm),
+          sd   = sd     (xx[[col]], na.rm=na.rm)
+        )
+      },
+      measurevar
+    )
+
+    # Rename the "mean" column    
+    datac <- plyr::rename(datac, c("mean" = measurevar))
+
+    datac$se <- datac$sd / sqrt(datac$N)  # Calculate standard error of the mean
+
+    # Confidence interval multiplier for standard error
+    # Calculate t-statistic for confidence interval: 
+    # e.g., if conf.interval is .95, use .975 (above/below), and use df=N-1
+    ciMult <- qt(conf.interval/2 + .5, datac$N-1)
+    datac$ci <- datac$se * ciMult
+
+    return(datac)
+}
+
+## Norms the data within specified groups in a data frame; it normalizes each
+## subject (identified by idvar) so that they have the same mean, within each group
+## specified by betweenvars.
+##   data: a data frame.
+##   idvar: the name of a column that identifies each subject (or matched subjects)
+##   measurevar: the name of a column that contains the variable to be summariezed
+##   betweenvars: a vector containing names of columns that are between-subjects variables
+##   na.rm: a boolean that indicates whether to ignore NA's
+normDataWithin <- function(data=NULL, idvar, measurevar, betweenvars=NULL,
+                           na.rm=FALSE, .drop=TRUE) {
+    library(plyr)
+
+    # Measure var on left, idvar + between vars on right of formula.
+    data.subjMean <- ddply(data, c(idvar, betweenvars), .drop=.drop,
+     .fun = function(xx, col, na.rm) {
+        c(subjMean = mean(xx[,col], na.rm=na.rm))
+      },
+      measurevar,
+      na.rm
+    )
+
+    # Put the subject means with original data
+    data <- merge(data, data.subjMean)
+
+    # Get the normalized data in a new column
+    measureNormedVar <- paste(measurevar, "_norm", sep="")
+    data[,measureNormedVar] <- data[,measurevar] - data[,"subjMean"] +
+                               mean(data[,measurevar], na.rm=na.rm)
+
+    # Remove this subject mean column
+    data$subjMean <- NULL
+
+    return(data)
+}
+
+## Summarizes data, handling within-subjects variables by removing 
+## inter-subject variability.
+## It will still work if there are no within-S variables.
+## Gives count, un-normed mean, normed mean (with same between-group mean),
+##   standard deviation, standard error of the mean, and confidence interval.
+## If there are within-subject variables, calculate adjusted values using method from Morey (2008).
+##   data: a data frame.
+##   measurevar: the name of a column that contains the variable to be summariezed
+##   betweenvars: a vector containing names of columns that are between-subjects variables
+##   withinvars: a vector containing names of columns that are within-subjects variables
+##   idvar: the name of a column that identifies each subject (or matched subjects)
+##   na.rm: a boolean that indicates whether to ignore NA's
+##   conf.interval: the percent range of the confidence interval (default is 95%)
+summarySEwithin <- function(data=NULL, measurevar, betweenvars=NULL, withinvars=NULL,
+                            idvar=NULL, na.rm=FALSE, conf.interval=.95, .drop=TRUE) {
+
+  # Ensure that the betweenvars and withinvars are factors
+  factorvars <- vapply(data[, c(betweenvars, withinvars), drop=FALSE],
+    FUN=is.factor, FUN.VALUE=logical(1))
+
+  if (!all(factorvars)) {
+    nonfactorvars <- names(factorvars)[!factorvars]
+    message("Automatically converting the following non-factors to factors: ",
+            paste(nonfactorvars, collapse = ", "))
+    data[nonfactorvars] <- lapply(data[nonfactorvars], factor)
+  }
+
+  # Get the means from the un-normed data
+  datac <- summarySE(data, measurevar, groupvars=c(betweenvars, withinvars),
+                     na.rm=na.rm, conf.interval=conf.interval, .drop=.drop)
+
+  # Drop all the unused columns (these will be calculated with normed data)
+  datac$sd <- NULL
+  datac$se <- NULL
+  datac$ci <- NULL
+
+  # Norm each subject's data
+  ndata <- normDataWithin(data, idvar, measurevar, betweenvars, na.rm, .drop=.drop)
+
+  # This is the name of the new column
+  measurevar_n <- paste(measurevar, "_norm", sep="")
+
+  # Collapse the normed data - now we can treat between and within vars the same
+  ndatac <- summarySE(ndata, measurevar_n, groupvars=c(betweenvars, withinvars),
+                      na.rm=na.rm, conf.interval=conf.interval, .drop=.drop)
+
+  # Apply correction from Morey (2008) to the standard error and confidence interval
+  #  Get the product of the number of conditions of within-S variables
+  nWithinGroups    <- prod(vapply(ndatac[,withinvars, drop=FALSE], FUN=nlevels,
+                           FUN.VALUE=numeric(1)))
+  correctionFactor <- sqrt( nWithinGroups / (nWithinGroups-1) )
+
+  # Apply the correction factor
+  ndatac$sd <- ndatac$sd * correctionFactor
+  ndatac$se <- ndatac$se * correctionFactor
+  ndatac$ci <- ndatac$ci * correctionFactor
+
+  # Combine the un-normed means with the normed results
+  merge(datac, ndatac)
+}
+```
+
+```{r 40_rt_plots, echo=FALSE, cache=TRUE, warning=FALSE, message=FALSE, quietly=TRUE}
+seplots1.rt <- summarySEwithin(aggregated.measures1, 
+                       measurevar="RT",
+                       withinvars="trial.type",
+                       idvar="personid")
+pd <- position_dodge(0.1) # move them .05 to the left and right
+
+rt1dotplot <- ggplot(seplots1.rt,
+       aes(x=trial.type, y=RT)) +
+    geom_errorbar(aes(ymin=RT-ci, ymax=RT+ci),
+                  colour="black", width=.1, position=pd) +
+    geom_line(position=pd) +
+    geom_point(position=pd, size=1, shape=21, fill="white") +
+    xlab("Trial type") +
+    ylab("Reaction time") +
+    ylim(c(725, 825)) +
+    # ggtitle("Reaction time depending on trial type with 95% CIs") +
+    theme_bw() +
+    theme(axis.text=element_text(size=12, color="darkgrey"),
+              axis.title=element_text(size=14))
+
+seplots2.rt <- summarySEwithin(aggregated.measures2.active, 
+                       measurevar="RT",
+                       withinvars="trial.type",
+                       idvar="personid")
+
+rt2dotplot <- ggplot(seplots2.rt,
+       aes(x=trial.type, y=RT)) +
+    geom_errorbar(aes(ymin=RT-ci, ymax=RT+ci),
+                  colour="black", width=.1, position=pd) +
+    geom_line(position=pd) +
+    geom_point(position=pd, size=1, shape=21, fill="white") +
+    xlab("Trial type") +
+    ylab("Reaction time") +
+    # ggtitle("Reaction time depending on trial type with 95% CIs") +
+    ylim(c(725, 825)) +
+    theme_bw() +
+    theme(axis.text=element_text(size=12, color="darkgrey"),
+          axis.title=element_text(size=14))
+
+
+seplots34.rt <- summarySEwithin(aggregated.measures34.active, 
+                       measurevar="RT", betweenvars="condition",
+                       withinvars="trial.type", idvar="personid")
+
+rt34dotplot <- ggplot(seplots34.rt, 
+       aes(x=condition, y=RT, linetype=trial.type, group=trial.type)) +
+    geom_errorbar(aes(ymin=RT-ci, ymax=RT+ci), 
+                  colour="black", width=.1, position=pd) +
+    geom_line(position=pd) + 
+    geom_point(position=pd, size=1, shape=21, fill="white") +
+    xlab("Condition") +
+    ylab("Reaction time") +
+    #scale_colour_hue(name="Trial type", l=40) +
+    #ggtitle("Reaction time depending on trial type and condition with CIs") +
+    ylim(c(700, 800)) +
+    theme_bw() + theme(legend.justification=c(1,0), legend.position="none") +
+    scale_x_discrete(labels=c("3" = "Online", "4" = "Offline")) +
+    scale_linetype_discrete(name="Trial type") +
+    theme(axis.text=element_text(size=12, color="darkgrey"),
+          axis.title=element_text(size=14))
+
+
+p <- plot_grid(rt1dotplot + ggtitle("Experiment 1"), 
+               rt2dotplot + ggtitle("Experiment 2"), 
+               rt34dotplot + theme(legend.position=c(0.45, 0.01)) +
+                    ggtitle("Experiment 3"),
+               align = 'vh', labels = c("A", "B", "C"), hjust = -1,
+               nrow = 2)
+p
+```
+
+## Trajectory plots
+
+We plot trajectories averaged across trials for each participant and across participants.
+
+```{r 41_ciplot, cache=TRUE, message=FALSE, echo=FALSE}
+create.trajciplot <- function(avg.tn.trajectories) {
+    tnx.across.subjects <- summarySEwithin(data=avg.tn.trajectories,
+                            measurevar="xpos",
+                            withinvars=c("trial.type", "steps"),
+                            idvar="personid")
+    tnx.across.subjects <- arrange(tnx.across.subjects, trial.type, steps)
+    
+    tny.across.subjects <- summarySEwithin(data=avg.tn.trajectories,
+                            measurevar="ypos", 
+                            withinvars=c("trial.type", "steps"),
+                            idvar="personid")
+    tny.across.subjects <- arrange(tny.across.subjects, trial.type, steps)
+
+    colnames(tnx.across.subjects)[6:8] <- c("sd_x", "se_x", "ci_x")
+    colnames(tny.across.subjects)[6:8] <- c("sd_y", "se_y", "ci_y")
+
+    tn.across.subjects <- merge(tnx.across.subjects, tny.across.subjects)
+    tn.across.subjects <- arrange(tn.across.subjects, trial.type, steps)
+
+    tn.across.subjects <- mutate(tn.across.subjects, 
+                                  lower.x=xpos-ci_x,
+                                  higher.x=xpos+ci_x,
+                                  lower.y=ypos-ci_y,
+                                  higher.y=ypos+ci_y)
+
+    congr.tn <- filter(tn.across.subjects, trial.type=="congruent")
+    incongr.tn <- filter(tn.across.subjects, trial.type=="incongruent")
+
+    x.congr <- c(congr.tn$higher.x, rev(congr.tn$lower.x))
+    y.congr <- c(congr.tn$higher.y, rev(congr.tn$lower.y))
+    x.incongr <- c(incongr.tn$higher.x, rev(incongr.tn$lower.x))
+    y.incongr <- c(incongr.tn$higher.y, rev(incongr.tn$lower.y))
+
+    areas <- data.frame(xcon=x.congr, ycon=y.congr, 
+                        xincon=x.incongr, yincon=y.incongr)
+
+    trajplot <- ggplot() + 
+        geom_polygon(data=areas, aes(x=x.incongr, y=y.incongr), 
+                     fill="lightgrey") +
+        geom_polygon(data=areas, aes(x=x.congr, y=y.congr), fill="grey") +
+        geom_path(data=tn.across.subjects, 
+                  aes(x=xpos, y=ypos, linetype=trial.type)) +
+        theme_bw() +
+        xlab("X coordinate") +
+        ylab("Y coordinate") +
+        xlim(0, 0.9) + ylim(0, 1.5) +
+        theme(legend.position="none", axis.text=element_text(size=12, color="darkgrey"),
+              axis.title=element_text(size=14)) +
+        scale_linetype_discrete(name="Trial type")
+        return(trajplot)
+}
+```
+
+```{r 42_group_plots_active, cache=TRUE, message=FALSE, fig.width=10, echo=FALSE}
+# Condition 1
+avg.tn.trajectories1 <- mt_aggregate_per_subject(mtdata1,
+                        use="tn_trajectories",
+                        use2_variables="trial.type",
+                        subject_id="personid")
+avg.tn.trajectories1$personid <- droplevels(avg.tn.trajectories1$personid)
+avg.tn.trajectories1$trial.type <- as.factor(avg.tn.trajectories1$trial.type)
+
+traj1plot <- create.trajciplot(avg.tn.trajectories1)
+
+# Condition 2
+avg.tn.trajectories2 <- 
+    mt_aggregate_per_subject(mtdata2,
+                             use="tn_trajectories", 
+                             use2_variables=c("role.type", "trial.type"), 
+                             subject_id="personid")
+traj2plot <- create.trajciplot(filter(avg.tn.trajectories2, role.type=="active"))
+traj2plot <- traj2plot + theme(legend.position=c(0.2, 0.8))
+
+# Condition 3-4
+avg.tn.trajectories34 <- mt_aggregate_per_subject(mtdata,
+                        use="tn_trajectories",
+                        use2_variables=c("condition", "trial.type", "role.type"),
+                        subject_id="personid")
+traj3plot <- create.trajciplot(filter(avg.tn.trajectories34, 
+                                       condition=="3", role.type=="active"))
+traj4plot <- create.trajciplot(filter(avg.tn.trajectories34, 
+                                       condition=="4", role.type=="active"))
+
+prow <- plot_grid(traj1plot + theme(legend.position="none") + ggtitle("Experiment 1"),
+                  traj2plot + theme(legend.position="none") + ggtitle("Experiment 2"),
+                  traj3plot + theme(legend.position="none") + ggtitle("Experiment 3: Online"),
+                  traj4plot + theme(legend.position="none") + ggtitle("Experiment 3: Offline"),
+                  align = 'vh',
+                  labels = c("A", "B", "C", "D"),
+                  hjust = -1,
+                  nrow = 2)
+
+legend_b <- get_legend(traj1plot + theme(legend.position="bottom"))
+p <- plot_grid(prow, legend_b, ncol = 1, rel_heights = c(1, .2))
+p
+```
+
+```{r print_fig1, eval=FALSE, echo=FALSE, message=FALSE, warning=FALSE}
+setEPS()
+postscript("fig1a.eps", width=5, height=3)
+print(rt1dotplot)
+dev.off()
+
+setEPS()
+postscript("fig1b.eps", width=5, height=3)
+print(traj1plot)
+dev.off()
+
+setEPS()
+postscript("fig1c.eps", width=5, height=3)
+print(rt2dotplot)
+dev.off()
+
+setEPS()
+postscript("fig1d.eps", width=5, height=3)
+print(traj2plot)
+dev.off()
+```
+
+```{r print_fig3, eval=FALSE, echo=FALSE, message=FALSE, warning=FALSE}
+setEPS()
+postscript("fig3a.eps", width=5, height=3)
+print(rt34dotplot)
+dev.off()
+
+setEPS()
+postscript("fig3b.eps", width=5, height=3)
+print(traj3plot)
+dev.off()
+
+setEPS()
+postscript("fig3c.eps", width=5, height=3)
+print(traj4plot)
+dev.off()
+```
+
+We also plot passive trajectories.
+
+```{r 43_group_plots_passive, cache=TRUE, message=FALSE, fig.width=10, echo=FALSE}
+traj2plot.pass <- create.trajciplot(filter(avg.tn.trajectories2, role.type=="passive"))
+
+traj3plot.pass <- create.trajciplot(filter(avg.tn.trajectories34, 
+                                       condition=="3", role.type=="passive"))
+traj4plot.pass <- create.trajciplot(filter(avg.tn.trajectories34, 
+                                       condition=="4", role.type=="passive"))
+
+prow <- plot_grid(traj2plot.pass + theme(legend.position="none") + ggtitle("Experiment 2"),
+                  traj3plot.pass + theme(legend.position="none") + 
+                      ggtitle("Experiment 3: Online"),
+                  traj4plot.pass + theme(legend.position="none") + 
+                      ggtitle("Experiment 3: Offline"),
+                  align = 'vh',
+                  labels = c("A", "B", "C"),
+                  hjust = -1,
+                  nrow = 1)
+
+legend_b <- get_legend(traj2plot.pass + theme(legend.position="bottom"))
+p <- plot_grid(prow, legend_b, ncol = 1, rel_heights = c(1, .2))
+p
+```
+
+From these plots it would seem that in experiment 1 the trial type affects
+movement trajectory with incongruent trials taking longer and producing trajectories
+more deviated towards the wrong response. By contrast, in experiment 2 and 3
+both reaction time and trajectories look similar independently of the trial type.
+Furthermore, in experiment 2 and 3 participants seem to go straight for their 
+assigned response button instead of producing curved trajectories typically found 
+in mouse-tracking studies.
+
+
+# Statistical analysis
+
+Exploratory analysis suggests that conditions differ in how the type of trial
+affects participant behavior. There seems to be a notable Simon effect in the
+individual condition but no effect in individual GoNo-Go condition or social conditions.
+
+In this part we will complement plot-based observations with statistical analysis.
+The analysis is carried out separately for 2 types of individual conditions and the
+social conditions.
+
+## Reaction time
+
+The following are results for 
+
+* a paired t-test on reaction times from experiment 1
+* a paired t-test on reaction times from experiment 2
+* a mixed ANOVA on reaction times from experiment 3 (between-subject variable
+condition and within-subject variable trial type)
+
+```{r 44_ttest_rt, echo=FALSE, cache=TRUE, warning=FALSE, message=FALSE}
+rt1.model <- t.test(RT ~ trial.type, data=aggregated.measures1, paired=TRUE, alternative="less")
+r <- round(sqrt(rt1.model$statistic[[1]]^2 / 
+                    (rt1.model$statistic[[1]]^2 + 
+                         rt1.model$parameter[[1]])), 3)
+
+rt2.model <- t.test(RT ~ trial.type, data=aggregated.measures2.active,
+                    paired=TRUE, alternative="less")
+r <- round(sqrt(rt2.model$statistic[[1]]^2 / 
+                    (rt2.model$statistic[[1]]^2 + 
+                         rt2.model$parameter[[1]])), 3)
+rt1.model
+rt2.model
+```
+
+```{r 45_anova_rt, cache=TRUE, warning=FALSE, message=FALSE, echo=FALSE}
+aov.rt34 <- aov_ez(data=aggregated.measures34.active,
+       id="personid", dv="RT", within = "trial.type",
+       between="condition",
+       anova_table = list(es=c("ges", "pes"), correction=c("GG")))
+aov.rt34
+```
+
+We find a significantly larger reaction time in incongruent trials only in experiment 1.
+
+
+## Area under curve
+
+### Bimodality analysis
+
+Sometimes, averaging trajectories produces artifical results. For example, a smooth
+average trajectory for a given participant could be a result of a large number
+of straight trajectories that go directly to the target and discrete error type
+of trajectories where participant first moves directly to the wrong side and then
+abruptly changes direction.
+
+The main method to eliminate this possibility relies on bimodality analysis, which checks whether spatial measures are bimodally distributed. This can be determined by looking
+at histograms of standardized trajectory deviation measures or by calculating
+a bimodality coefficient.
+
+```{r 46_bimodality, cache=TRUE, message=FALSE, echo=FALSE}
+theme_set(theme_grey())
+# Condition 1
+# standardize measures per participant
+mtdata1 <- mt_standardize(mtdata1, use_variables = "AUC", 
+                             within = "personid", prefix = "z_")
+# merge trial level data (needed for distribution qplot with facets)
+mt.merged <- merge(mtdata1$data, mtdata1$measures, by="mt_id")
+# plot distribution
+p1 <- qplot(x=z_AUC, data=mt.merged, bins=50) + facet_grid(. ~ trial.type) +
+    ggtitle("Experiment 1")
+p1
+# calculate bimodality coefficient
+bm.check1 <- mt_check_bimodality(mtdata1, 
+                                use_variables = "z_AUC", 
+                                grouping_variables = "trial.type", methods = "BC")
+bm.check1
+
+# Condition 2
+# standardize measures per participant
+active2 <- mt_standardize(active2, use_variables = "AUC", 
+                             within = "personid", prefix = "z_")
+# merge trial level data (needed for distribution qplot with facets)
+mt.merged <- merge(active2$data, active2$measures, by="mt_id")
+# plot distribution
+p2 <- qplot(x=z_AUC, data=mt.merged, bins=50) + facet_grid(. ~ trial.type) +
+    ggtitle("Experiment 2")
+p2
+# calculate bimodality coefficient
+bm.check2 <- mt_check_bimodality(active2, 
+                                use_variables = "z_AUC", 
+                                grouping_variables = "trial.type", methods = "BC")
+bm.check2
+
+# Conditions 3-4
+# standardize measures per participant
+activedata <- mt_standardize(activedata, use_variables = "AUC", 
+                             within = "personid", prefix = "z_")
+# merge trial level data (needed for distribution qplot with facets)
+mt.merged <- merge(activedata$data, activedata$measures, by="mt_id")
+# plot distribution
+qplot(x=z_AUC, data=mt.merged, bins=50) + facet_grid(condition ~ trial.type) +
+    ggtitle("Experiment 3")
+
+# calculate bimodality coefficient
+bm.check34 <- mt_check_bimodality(activedata, 
+                                use_variables = "z_AUC", 
+                                grouping_variables = "trial.type", methods = "BC")
+bm.check34
+```
+
+A distribution is considered bimodal if BC > 0.555. In our case neither distribution
+plots nor bimodality coefficients (which are below 0.555 for all conditions) give 
+any reason to suspect bimodal data that could blur our results.
+
+We therefore proceed with analysis of area under curve measure in experiments 1-3 
+as with RT measure.
+
+```{r 47_ttest_auc, cache=TRUE, echo=FALSE, warning=FALSE, message=FALSE}
+auc1.model <- t.test(AUC ~ trial.type, data=aggregated.measures1.active, 
+                     paired=TRUE, alternative="less")
+r <- round(sqrt(auc1.model$statistic[[1]]^2 / 
+                    (auc1.model$statistic[[1]]^2 + 
+                         auc1.model$parameter[[1]])), 3)
+auc1.model
+
+auc2.model <- t.test(AUC ~ trial.type, data=aggregated.measures2.active,
+                     paired=TRUE, alternative="less")
+r <- round(sqrt(auc2.model$statistic[[1]]^2 / 
+                    (auc2.model$statistic[[1]]^2 + 
+                         auc2.model$parameter[[1]])), 3)
+auc2.model
+# by(aggregated.measures2.passive$ypos_max_time,
+#    aggregated.measures2.passive$trial.type,
+#    stat.desc, basic=FALSE, norm=TRUE)
+# 
+# maxy.model <- t.test(ypos_max_time ~ trial.type,
+#                      data=aggregated.measures2.passive,
+#                      paired=TRUE)
+```
+
+```{r 48_anova_auc, cache=TRUE, warning=FALSE, message=FALSE, echo=FALSE}
+aov.auc34 <- aov_ez(data=aggregated.measures34.active,
+       id="personid", dv="AUC", within = "trial.type",
+       between="condition",
+       anova_table = list(es=c("ges", "pes"), correction=c("GG")))
+aov.auc34
+```
+
+
+# Individual-level analysis
+
+## Individual trajectory plots
+
+To check whether the patterns we find on the group level also hold on the individual 
+level, we can also examine average trajectories of individual participants.
+
+```{r 49_avg_person, cache=FALSE, message=FALSE, fig.width=10, fig.height=10, echo=FALSE}
+theme_set(theme_grey())
+ind1 <- ggplot(avg.tn.trajectories1, 
+       aes(x=xpos, y=ypos, linetype=trial.type)) + 
+    geom_path() + facet_wrap(~personid) +
+    ggtitle("Person average trajectories, experiment 1") +
+    scale_linetype_discrete(name="Trial type") +
+    xlab("X coordinate") + ylab("Y coordinate")
+
+ind2 <- ggplot(avg.tn.trajectories2, 
+       aes(x=xpos, y=ypos, color=role.type, linetype=trial.type)) + 
+    geom_path() + facet_wrap(~personid) +
+    ggtitle("Person average trajectories, experiment 2") +
+    scale_linetype_discrete(name="Trial type") +
+    scale_color_discrete(name="Role type") +
+    xlab("X coordinate") + ylab("Y coordinate")
+
+ind3a <- ggplot(filter(avg.tn.trajectories34, condition==3), 
+       aes(x=xpos, y=ypos, color=role.type, linetype=trial.type)) + 
+    geom_path() + facet_wrap(~personid) +
+    ggtitle("Person average trajectories, experiment 3, Online") +
+    scale_linetype_discrete(name="Trial type") +
+    scale_color_discrete(name="Role type") +
+    xlab("X coordinate") + ylab("Y coordinate")
+
+ind3b <- ggplot(filter(avg.tn.trajectories34, condition==4), 
+       aes(x=xpos, y=ypos, color=role.type, linetype=trial.type)) + 
+    geom_path() + facet_wrap(~personid) +
+    ggtitle("Person average trajectories, experiment 3, Offline") +
+    scale_linetype_discrete(name="Trial type") +
+    scale_color_discrete(name="Role type") +
+    xlab("X coordinate") + ylab("Y coordinate")
+
+ind1
+ind2
+ind3a
+ind3b
+
+setEPS()
+postscript("ind1.eps", width=8, height=8)
+print(ind1)
+dev.off()
+
+setEPS()
+postscript("ind2.eps", width=8, height=8)
+print(ind2)
+dev.off()
+
+setEPS()
+postscript("ind3a.eps", width=8, height=8)
+print(ind3a)
+dev.off()
+
+setEPS()
+postscript("ind3b.eps", width=8, height=8)
+print(ind3b)
+dev.off()
+```
+
+Here we can make several observations. 
+
+1. The group pattern holds for all individuals in experiment 1.
+2. In experiments 2 and 3 the group pattern holds for the majority but no all individuals.
+3. The majority of participants in experiment 2 and 3 adopt a strategy of moving
+directly toward the response box rather than moving first upward.
+3. In experiment 2 six out of twenty participants seemt to show upward trajectories,
+similar to those observed in experiment 1.
+4. In experiment 3 five out of 58 participants show upward trajectories.
+5. Most participants seem to proceed all the way to the response box even when
+it is not their turn to respond, i.e. despite the fact that they could return to 
+the starting position as soon as it became clear it is not their trial.
+
+We can confirm the latter observation by also plotting a histogram of maximum y 
+coordinate reached in passive trials. The thresholds indicated on the plot are the 
+locations of the start boundary, the y-coordinate that had to be crossed in order 
+for the cue to appear and the lower response box boundary. As can be seen from the plot,
+the majority of trajectories goes beyond that last threshold.
+
+```{r 50_passive_hist, cache=TRUE, message=FALSE, echo=FALSE}
+cuts <- data.frame(Thresholds=c('start', 'stimulus', 'response'), 
+                   vals=c(scaled.start.boundary, scaled.stim.boundary, 
+                          scaled.response.boundary))
+# we need to use data before alignment was performed
+exp2.scaled %>% group_by(personid, trial) %>%
+    filter(role.type=="passive") %>% 
+    dplyr::mutate(maxy = max(y.scaled)) %>%
+    filter(row_number()==1) %>%
+    dplyr::select(maxy) ->
+        max.ys2
+exp3.scaled %>% group_by(personid, trial) %>%
+    filter(role.type=="passive") %>% 
+    dplyr::mutate(maxy = max(y.scaled)) %>%
+    filter(row_number()==1) %>%
+    dplyr::select(maxy) ->
+        max.ys3
+exp4.scaled %>% group_by(personid, trial) %>%
+    filter(role.type=="passive") %>% 
+    dplyr::mutate(maxy = max(y.scaled)) %>%
+    filter(row_number()==1) %>%
+    dplyr::select(maxy) ->
+        max.ys4
+
+cond.vec <- c(rep("condition2", dim(max.ys2)[1]), 
+              rep("condition3", dim(max.ys3)[1]),
+              rep("condition4", dim(max.ys4)[1]))
+max.ys <- data.frame(condition=cond.vec,
+                     maxy = c(max.ys2$maxy, max.ys3$maxy, max.ys4$maxy))
+ggplot(max.ys, aes(x=maxy)) + facet_grid(condition~.) +
+    geom_histogram() +
+    geom_vline(data=cuts, aes(xintercept=vals, color=Thresholds))
+```
+
+```{r print_fig2, eval=FALSE, cache=TRUE, message=FALSE, echo=FALSE}
+plot.person.passive <- function(person) {
+    passiveplot <- ggplot(filter(exp2.clean,
+                                 role.type=="passive",
+                                 personid==person, 
+                                 trial %in% c(600:640)), 
+                          aes(x=x.flipped, y=y.aligned, 
+                              linetype=trial.type)) + 
+        geom_path(color = "grey") +
+        geom_path(data=filter(avg.tn.trajectories2,
+                              role.type=="passive",
+                              personid==person),
+                  aes(x=xpos, y=ypos, linetype=trial.type)) +
+        xlab("X coordinate") + ylab("Y coordinate") +
+        xlim(c(-1, 1)) + ylim(c(-0.25, 1.5)) +
+        theme_bw() + theme(legend.position = "none") + 
+        scale_linetype_discrete(name="Trial type") +
+        theme(legend.position="none", axis.text=element_text(size=12, color="darkgrey"),
+              axis.title=element_text(size=14))
+    return(passiveplot)
+}
+
+c2p1plot.pass <- plot.person.passive("c2p1")
+c2p10plot.pass <- plot.person.passive("c2p10")
+c2p16plot.pass <- plot.person.passive("c2p16")
+
+setEPS()
+postscript("fig2a.eps", width=5, height=3)
+print(c2p1plot.pass)
+dev.off()
+
+setEPS()
+postscript("fig2b.eps", width=5, height=3)
+print(c2p10plot.pass)
+dev.off()
+
+setEPS()
+postscript("fig2c.eps", width=5, height=3)
+print(c2p16plot.pass)
+dev.off()
+```
+
+```{r print_fig4, eval=FALSE, echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+create.trajciplot.person <- function(subdata) {
+    subdata.traj <- as.data.frame.table(subdata$tn_trajectories)
+    subdata.wide <- spread(subdata.traj, key="Var3", value="Freq")
+    subdata.clean <- select(subdata.wide, -Var2)
+    colnames(subdata.clean)[1] <- "mt_id"
+    d <- select(subdata$data, trial, trial.type, mt_id)
+    subdata.merged <- merge(subdata.clean, d, by="mt_id")
+    
+    tnx.across.subjects <- summarySEwithin(data=subdata.merged,
+                        measurevar="xpos",
+                        withinvars=c("trial.type", "steps"),
+                        idvar="trial")
+    tnx.across.subjects <- arrange(tnx.across.subjects, trial.type, steps)
+    
+    tny.across.subjects <- summarySEwithin(data=subdata.merged,
+                            measurevar="ypos", 
+                            withinvars=c("trial.type", "steps"),
+                            idvar="trial")
+    tny.across.subjects <- arrange(tny.across.subjects, trial.type, steps)
+
+    colnames(tnx.across.subjects)[6:8] <- c("sd_x", "se_x", "ci_x")
+    colnames(tny.across.subjects)[6:8] <- c("sd_y", "se_y", "ci_y")
+
+    tn.across.subjects <- merge(tnx.across.subjects, tny.across.subjects)
+    tn.across.subjects <- arrange(tn.across.subjects, trial.type, steps)
+
+    tn.across.subjects <- mutate(tn.across.subjects, 
+                                  lower.x=xpos-ci_x,
+                                  higher.x=xpos+ci_x,
+                                  lower.y=ypos-ci_y,
+                                  higher.y=ypos+ci_y)
+
+    congr.tn <- filter(tn.across.subjects, trial.type=="congruent")
+    incongr.tn <- filter(tn.across.subjects, trial.type=="incongruent")
+
+    x.congr <- c(congr.tn$higher.x, rev(congr.tn$lower.x))
+    y.congr <- c(congr.tn$higher.y, rev(congr.tn$lower.y))
+    x.incongr <- c(incongr.tn$higher.x, rev(incongr.tn$lower.x))
+    y.incongr <- c(incongr.tn$higher.y, rev(incongr.tn$lower.y))
+
+    areas <- data.frame(xcon=x.congr, ycon=y.congr, 
+                        xincon=x.incongr, yincon=y.incongr)
+
+    trajplot <- ggplot() + 
+        geom_polygon(data=areas, aes(x=x.incongr, y=y.incongr), 
+                     fill="lightgrey") +
+        geom_polygon(data=areas, aes(x=x.congr, y=y.congr), fill="grey") +
+        geom_path(data=tn.across.subjects, 
+                  aes(x=xpos, y=ypos, linetype=trial.type)) +
+        theme_bw() +
+        xlab("X coordinate") +
+        ylab("Y coordinate") +
+        xlim(-0.1, 0.9) + ylim(0, 1.5) +
+        scale_linetype_discrete(name="Trial type") +
+        theme(legend.position="none", axis.text=element_text(size=12, color="darkgrey"),
+              axis.title=element_text(size=14))
+    return(trajplot)
+}
+
+c3p21.plot <- create.trajciplot.person(mt_subset(activedata, personid=="c3p21"))
+c4p19.plot <- create.trajciplot.person(mt_subset(activedata, personid=="c4p19"))
+c3p26.plot <- create.trajciplot.person(mt_subset(activedata, personid=="c3p26"))
+
+c2p13.plot <- create.trajciplot.person(mt_subset(active2, personid=="c2p13"))
+c2p13.plot <- c2p13.plot + xlim(c(-0.3, 1))
+c2p6.plot <- create.trajciplot.person(mt_subset(active2, personid=="c2p6"))
+c2p8.plot <- create.trajciplot.person(mt_subset(active2, personid=="c2p8"))
+
+
+setEPS()
+postscript("fig4a.eps", width=5, height=3)
+print(c3p21.plot)
+dev.off()
+
+setEPS()
+postscript("fig4b.eps", width=5, height=3)
+print(c4p19.plot)
+dev.off()
+
+setEPS()
+postscript("fig4c.eps", width=5, height=3)
+print(c3p26.plot)
+dev.off()
+
+setEPS()
+postscript("fig4d.eps", width=5, height=3)
+print(c2p13.plot)
+dev.off()
+
+setEPS()
+postscript("fig4e.eps", width=5, height=3)
+print(c2p6.plot)
+dev.off()
+
+setEPS()
+postscript("fig4f.eps", width=5, height=3)
+print(c2p8.plot)
+dev.off()
+```
+
+
+## Trajectory prototypes
+
+In order to examine the qualitative difference between individual trajectories 
+in a more unbiased manner, we can automatically assign participants to straight 
+vs curved motion strategy based on the shape of the majority of their
+trajectories. Mousetrap package provides a possibility for mapping collected 
+trajectories to a number of trajectory prototypes frequently encountered in mouse 
+tracking experiments, such as these:
+
+```{r 53_prototypes, cache=TRUE, echo=FALSE, fig.height=3}
+theme_set(theme_grey())
+proto <- mt_remap_symmetric(mt_prototypes, remap_xpos = "right")
+protoplot <- mt_plot(proto, facet_col="mt_id") +
+    facet_grid(.~factor(mt_id,levels=unique(mt_id))) + theme_bw() +
+    scale_x_continuous(breaks=c(-1, 0, 1)) 
+protoplot
+
+# setEPS()
+# postscript("prototypes.eps", width=5, height=3)
+# print(protoplot)
+# dev.off()
+```
+
+We can map trajectories collected in our experiment to the prototypes and plot them.
+Given that variability is mostly present in experiments 2 and 3, we focus on this
+data here.
+
+```{r 54_prototypes_own, cache=TRUE, echo=FALSE, fig.height=3}
+theme_set(theme_grey())
+active2 <- mt_spatialize(active2, n_points=50)
+active2 <- mt_map(active2, use="sp_trajectories", prototypes = proto,
+                  pointwise = FALSE)
+mt_plot(active2, use="sp_trajectories", 
+        use2="prototyping",
+        facet_col="prototype_label") +
+    ggtitle("Trajectories of experiment 2 by prototype")
+
+activedata <- mt_spatialize(activedata, n_points=50)
+activedata <- mt_map(activedata, use="sp_trajectories", prototypes = proto)
+mt_plot(activedata, use="sp_trajectories", 
+        use2="prototyping",
+        facet_col="prototype_label") +
+    ggtitle("Trajectories of experiment 3 by prototype")
+```
+
+We can also plot the distribution of trajectories for all the individual
+participants, focusing here on the two main types, "straight" and "curved"+"cCoM" prototypes.
+
+```{r 55_prototypes_hist, cache=TRUE, echo=FALSE, fig.height=3, fig.width=10}
+theme_set(theme_grey())
+active2.proto.merge <- merge(active2$data, active2$prototyping, by="mt_id")
+levels(active2.proto.merge$prototype_label)[levels(active2.proto.merge$prototype_label)=="cCoM"] <- "curved"
+levels(active2.proto.merge$prototype_label)[levels(active2.proto.merge$prototype_label)=="dCoM"] <- "curved"
+
+ggplot(filter(active2.proto.merge, 
+              prototype_label %in% c("straight", "curved")),
+       aes(x=personid, fill=prototype_label)) + geom_bar(position="dodge") +
+    ggtitle("Experiment 2")
+
+active34.proto.merge <- merge(activedata$data, activedata$prototyping, by="mt_id")
+levels(active34.proto.merge$prototype_label)[levels(active34.proto.merge$prototype_label)=="cCoM"] <- "curved"
+levels(active34.proto.merge$prototype_label)[levels(active34.proto.merge$prototype_label)=="dCoM"] <- "curved"
+
+ggplot(filter(active34.proto.merge, condition == 3,
+              prototype_label %in% c("straight", "curved")),
+       aes(x=personid, fill=prototype_label)) + geom_bar(position="dodge") +
+    theme(legend.position = c(0.8, 0.8), 
+          axis.text.x = element_text(angle = 90, hjust = 1)) +
+    ggtitle("Experiment 3, Online")
+ggplot(filter(active34.proto.merge, condition == 4,
+              prototype_label %in% c("straight", "curved")),
+       aes(x=personid, fill=prototype_label)) + geom_bar(position="dodge") +
+    theme(legend.position = c(0.8, 0.8), 
+          axis.text.x = element_text(angle = 90, hjust = 1)) +
+    ggtitle("Experiment 3, Offline")
+```
+
+We can now use the prototype information to asign participants to a "straight" or
+"curved" group. We do this by simple majority i.e., if the majority of a given 
+person's trajectories are straight, they are assigned to the straight group and 
+analogously for the curved trajectories.
+
+```{r 56_curved_straight, cache=TRUE, echo=FALSE}
+curved2 <- mt_subset(mtdata2, personid %in% c("c2p1", "c2p2", "c2p6", 
+                                              "c2p13", "c2p19"))
+straight2 <- mt_subset(mtdata2, !(personid %in% c("c2p1", "c2p2", "c2p6", 
+                                              "c2p13", "c2p19")))
+
+curved <- mt_subset(mtdata, (condition == 3 & personid %in% 
+                                 c("c3p15", "c3p21", "c3p22")) |
+                        (condition == 4 & personid %in% 
+                             c("c4p11", "c4p19")))
+straight <- mt_subset(mtdata, !((condition == 3 & personid 
+                                 %in% c("c3p15", "c3p21", "c3p22")) |
+                        (condition == 4 & personid %in% 
+                             c("c4p11", "c4p19"))))
+```
+
+
+## Individual-level analyses
+
+Since we have seen that participants tend to employ two qualitatively different
+movement patterns, a question we can ask is whether two groups also lead to 
+qualitatively different statistical results. To that end we run t-tests on the 
+individual level. Our prediction is that curved participants but not straight 
+participants show significantly higher RT and AUC in incongruent trials compared 
+to congruent trials.
+
+```{r 57_individual_t, echo=FALSE, cache=TRUE}
+get.individual.ttests <- function(merged) {
+    active.ids <- unique(merged$personid)
+    n.persons <- length(active.ids)
+    outcomes <- matrix(nrow=n.persons*2, ncol=10)
+    
+    for (i in seq(n.persons)) {
+        id <- active.ids[i]
+        trials <- filter(merged, personid == id)
+        rt <- t.test(RT ~ trial.type, data=trials, alternative="less", paired=FALSE)
+        auc <- t.test(AUC ~ trial.type, data=trials, alternative="less", paired=FALSE)
+
+        r.rt <- round(sqrt(rt$statistic^2 / 
+                               (rt$statistic^2 + rt$parameter)), 3)
+        new.row <- c(as.character(id), "RT", 
+                     round(rt$statistic, 3), rt$parameter, 
+                     round(rt$p.value, 5), round(rt$conf.int[1], 3), 
+                     round(rt$conf.int[2], 3), round(rt$estimate, 3)[1],
+                     round(rt$estimate, 3)[2],
+                     r.rt)
+        outcomes[2*i-1,] <- new.row
+
+        r.auc <- round(sqrt(auc$statistic^2 / 
+                               (auc$statistic^2 + auc$parameter)), 3)
+        new.row <- c(as.character(id), "AUC", 
+                     round(auc$statistic, 3), auc$parameter, 
+                     round(auc$p.value, 5), round(auc$conf.int[1], 3), 
+                     round(auc$conf.int[2], 3), round(auc$estimate, 3)[1],
+                     round(auc$estimate, 3)[2],
+                     r.auc)
+        outcomes[2*i,] <- new.row
+    }
+    outcomes <- data.frame(outcomes)
+    colnames(outcomes) <- c('personid', 'measure',
+                            't', 'df', 'p', 'lower.conf', 
+                            'upper.conf', 'estimate1', 'estimate2','effect')
+    cols <- c(3:10)
+    outcomes[,cols] <- apply(outcomes[,cols], 2, 
+                             function(x) as.numeric(as.character(x)))
+    return(outcomes)
+}
+
+
+curved2.merged <- merge(curved2$data, curved2$measures,
+                        by="mt_id")
+active.curved2.merged <- filter(curved2.merged, role.type=="active")
+straight2.merged <- merge(straight2$data, straight2$measures,
+                         by="mt_id")
+active.straight2.merged <- filter(straight2.merged, role.type=="active")
+
+ttests2.curved <- get.individual.ttests(active.curved2.merged)
+ttests2.straight <- get.individual.ttests(active.straight2.merged)
+ttests2.curved$prototype = "curved"
+ttests2.straight$prototype = "straight"
+ttests2 <- rbind(ttests2.curved, ttests2.straight)
+kable(ttests2)
+
+curved34.merged <- merge(curved$data, curved$measures,
+                         by="mt_id")
+active.curved34.merged <- filter(curved34.merged, role.type=="active")
+straight34.merged <- merge(straight$data, straight$measures,
+                         by="mt_id")
+active.straight34.merged <- filter(straight34.merged, role.type=="active")
+
+ttests34.curved <- get.individual.ttests(active.curved34.merged)
+ttests34.straight <- get.individual.ttests(active.straight34.merged)
+ttests34.curved$prototype = "curved"
+ttests34.straight$prototype = "straight"
+ttests34 <- rbind(ttests34.curved, ttests34.straight)
+kable(ttests34)
+```
+
+
+## Sample entropy
+
+In some cases, it may be helpful to measure the complexity of mouse trajectories. 
+For example, if both response alternatives simultaneously attract participants'
+mouse movement (relative to only one), this additional stress might manifest 
+as less smooth, more complex, and fluctuating trajectories. 
+One of the measures of trajectory complexity is sample entropy, which is based on
+predictability of trajectory given a number of surrounding coordinates.
+We calculate sample entropy for all the data using a function provided by the
+mousetrap package with default settings. It is calculated for all individual trajectories
+and then we average across trajectories to obtain measures for each participant,
+separately for different data types and separately for active and passive trials
+(in experiments 2 and 3).
+
+```{r 58_sample_entropy, cache=TRUE, message=FALSE, echo=FALSE}
+mtdata1 <- mt_sample_entropy(mtdata1, use="tn_trajectories", m=3, 
+                                dimension="xpos")
+agg.entropy1 <- mt_aggregate_per_subject(mtdata1, subject_id = "personid",
+                                        use_variables = "sample_entropy", 
+                                        use2_variables = "trial.type")
+
+mtdata2 <- mt_sample_entropy(mtdata2, use="tn_trajectories", m=3, 
+                                dimension="xpos")
+agg.entropy2 <- mt_aggregate_per_subject(mtdata2, subject_id = "personid",
+                                        use_variables = "sample_entropy", 
+                                        use2_variables = c("trial.type", "role.type"))
+agg.entropy2 <- filter(agg.entropy2, !(personid %in% c("c2p16", "c2p17")))
+
+mtdata <- mt_sample_entropy(mtdata, use="tn_trajectories", m=3, 
+                                dimension="xpos")
+mtdata.active <- mt_subset(mtdata, role.type=="active")
+agg.entropy34 <- mt_aggregate_per_subject(mtdata.active, subject_id = "personid",
+                                use_variables = "sample_entropy", 
+                                use2_variables = c("trial.type", "condition"))
+agg.entropy34 <- filter(agg.entropy34, !(personid %in% c("c4p13", "c4p24", "c4p30")))
+```
+
+Having obtained sample entropy measure we can subject it to standard statistical
+analyses. We compare the measures for congruent and incongruent trials (experiments
+1-3) and for passive and active trials (experiments 2 and 3).
+
+```{r 59_test_entropy, cache=TRUE, message=FALSE, echo=FALSE}
+t.test(sample_entropy~trial.type, data=agg.entropy1, paired=TRUE)
+
+entaov2 <- aov_ez(data=agg.entropy2,
+       id="personid", dv="sample_entropy", within = c("trial.type", "role.type"),
+       anova_table = list(es=c("ges", "pes"), correction=c("GG")))
+entaov2
+
+entaov34 <- aov_ez(data=agg.entropy34,
+       id="personid", dv="sample_entropy", within = "trial.type",
+       between="condition",
+       anova_table = list(es=c("ges", "pes"), correction=c("GG")))
+entaov34
+```
+
+In experiment 1 we see a highly significant difference in sample entropy between
+congruent and incongruent trials, indicating that participants' movement in 
+incongruent trials was more erratic. By contrast, in experiments 2 and 3, there 
+seems to be no effect on movement entropy by either role or trial type. Thus, entropy
+measure replicates the results of RTs and trajectory deviation.
